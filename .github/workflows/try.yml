@@ -1,0 +1,129 @@
+name: Build LSPosed
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build Type'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+      CCACHE_BASEDIR: "${{ github.workspace }}"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: "recursive"
+          fetch-depth: 0
+
+      - name: Write key (only for release)
+        if: ${{ github.event.inputs.build_type == 'release' && (github.ref == 'refs/heads/master' || github.ref_type == 'tag') }}
+        run: |
+          if [ ! -z "${{ secrets.KEY_STORE }}" ]; then
+            echo androidStorePassword='${{ secrets.KEY_STORE_PASSWORD }}' >> gradle.properties
+            echo androidKeyAlias='${{ secrets.ALIAS }}' >> gradle.properties
+            echo androidKeyPassword='${{ secrets.KEY_PASSWORD }}' >> gradle.properties
+            echo androidStoreFile='key.jks' >> gradle.properties
+            echo ${{ secrets.KEY_STORE }} | base64 --decode > key.jks
+          fi
+
+      - name: Checkout libxposed/api
+        uses: actions/checkout@v3
+        with:
+          repository: libxposed/api
+          path: libxposed/api
+
+      - name: Checkout libxposed/service
+        uses: actions/checkout@v3
+        with:
+          repository: libxposed/service
+          path: libxposed/service
+
+      - name: Setup Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Gradle
+        uses: gradle/gradle-build-action@v2
+        with:
+          gradle-home-cache-cleanup: true
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          max-size: 2G
+          key: ${{ runner.os }}
+          restore-keys: ${{ runner.os }}
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+
+      - name: Build dependencies
+        working-directory: libxposed
+        run: |
+          echo 'org.gradle.caching=true' >> ~/.gradle/gradle.properties
+          echo 'org.gradle.parallel=true' >> ~/.gradle/gradle.properties
+          echo 'org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8 -XX:+UseParallelGC' >> ~/.gradle/gradle.properties
+          echo 'android.native.buildOutput=verbose' >> ~/.gradle/gradle.properties
+          cd api
+          ./gradlew publishToMavenLocal
+          cd ../service
+          ./gradlew publishToMavenLocal
+
+      - name: Build with Gradle
+        run: |
+          if [ "${{ github.event.inputs.build_type }}" == "release" ]; then
+            ./gradlew assembleRelease zipAll
+          else
+            ./gradlew assembleDebug zipAll
+          fi
+
+      - name: Prepare artifact
+        if: success()
+        id: prepareArtifact
+        run: |
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+          riruReleaseName=$(ls magisk-loader/release/LSPosed-v*-riru-${BUILD_TYPE}.zip 2>/dev/null | awk -F '[/_.-]' '{print $3"_"$4"_"$5}')
+          zygiskReleaseName=$(ls magisk-loader/release/LSPosed-v*-zygisk-${BUILD_TYPE}.zip 2>/dev/null | awk -F '[/_.-]' '{print $3"_"$4"_"$5}')
+          
+          echo "riruReleaseName=$riruReleaseName" >> "$GITHUB_OUTPUT"
+          echo "zygiskReleaseName=$zygiskReleaseName" >> "$GITHUB_OUTPUT"
+          
+          mkdir -p LSPosed-riru LSPosed-zygisk
+          unzip -q magisk-loader/release/LSPosed-v*-riru-${BUILD_TYPE}.zip -d LSPosed-riru || true
+          unzip -q magisk-loader/release/LSPosed-v*-zygisk-${BUILD_TYPE}.zip -d LSPosed-zygisk || true
+
+      - name: Upload riru module
+        uses: actions/upload-artifact@v3.1.4
+        with:
+          name: ${{ steps.prepareArtifact.outputs.riruReleaseName }}
+          path: "./LSPosed-riru/*"
+          retention-days: 7
+
+      - name: Upload zygisk module
+        uses: actions/upload-artifact@v3.1.4
+        with:
+          name: ${{ steps.prepareArtifact.outputs.zygiskReleaseName }}
+          path: "./LSPosed-zygisk/*"
+          retention-days: 7
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v3.1.4
+        with:
+          name: LSPosed_APKs_${{ github.event.inputs.build_type }}
+          path: |
+            app/build/outputs/apk/${BUILD_TYPE}/*.apk
+            service/build/outputs/apk/${BUILD_TYPE}/*.apk
+          retention-days: 7
